@@ -1,6 +1,10 @@
 """
 Encode the raw corpora into token-id sequences for LM training.
 
+Memory-safe: token ids are streamed to a temporary flat uint16 file
+(never held in RAM all at once), then split and copied into the
+final memmaps in chunks.
+
 - Loads models/tokenizer-gpt2/tokenizer.json
 - Splits each raw file on <|endoftext|>, encodes docs, appends EOS
 - Token-level 80/20 train/val split (val = last 20% of tokens)
@@ -23,8 +27,10 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOK_PATH = os.path.join(BASE, "models", "tokenizer-gpt2", "tokenizer.json")
 RAW_GLOB = os.path.join(BASE, "data", "raw", "*.txt")
 OUT_DIR = os.path.join(BASE, "data", "tokenized")
+TMP_PATH = os.path.join(OUT_DIR, "_all_tokens.u16")
 EOS = "<|endoftext|>"
 VAL_FRACTION = 0.20  # 80/20 train/validation split
+CHUNK_TOKENS = 5_000_000  # memmap copy chunk size (keeps RAM low)
 
 
 def main() -> None:
@@ -49,45 +55,54 @@ def main() -> None:
         print("No raw .txt files in data/raw/.")
         sys.exit(1)
 
-    all_ids: list[int] = []
-    n_docs = 0
-    for path in files:
-        name = os.path.basename(path)
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            docs = [d.strip() for d in f.read().split(EOS)]
-        docs = [d for d in docs if d]
-        print(f"{name}: {len(docs)} docs, encoding...", flush=True)
-        # batch encode for speed
-        for i in range(0, len(docs), 512):
-            batch = docs[i:i + 512]
-            for enc in tok.encode_batch(batch):
-                all_ids.extend(enc.ids)
-                all_ids.append(eos_id)
-            n_docs += len(batch)
-            if (i // 512) % 20 == 0:
-                print(f"  ... {n_docs} docs, {len(all_ids)/1e6:.1f}M tokens",
-                      flush=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    arr = np.array(all_ids, dtype=np.uint16)
-    n_total = len(arr)
+    # Phase 1: stream-encode -> flat temp file, counting as we go.
+    n_docs, n_total = 0, 0
+    with open(TMP_PATH, "wb") as tmp:
+        for path in files:
+            name = os.path.basename(path)
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                docs = [d.strip() for d in f.read().split(EOS)]
+            docs = [d for d in docs if d]
+            print(f"{name}: {len(docs)} docs, encoding...", flush=True)
+            for i in range(0, len(docs), 256):
+                batch = docs[i:i + 256]
+                buf = []
+                for enc in tok.encode_batch(batch):
+                    buf.extend(enc.ids)
+                    buf.append(eos_id)
+                np.array(buf, dtype=np.uint16).tofile(tmp)
+                n_docs += len(batch)
+                n_total += len(buf)
+                if (i // 256) % 40 == 0:
+                    print(f"  ... {n_docs} docs, {n_total / 1e6:.1f}M tokens",
+                          flush=True)
+    print(f"encoded {n_total / 1e6:.1f}M tokens from {n_docs} docs")
+
+    # Phase 2: split 80/20 and copy into block-aligned memmaps, in chunks.
+    flat = np.memmap(TMP_PATH, dtype=np.uint16, mode="r", shape=(n_total,))
     n_val = int(n_total * VAL_FRACTION)
-    n_val -= n_val % args.block_size  # keep val a whole number of blocks
+    n_val -= n_val % args.block_size
     n_train = n_total - n_val
     n_train -= n_train % args.block_size
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    train = arr[:n_train].reshape(-1, args.block_size)
-    val = arr[n_train:n_train + n_val].reshape(-1, args.block_size)
-
-    def save_memmap(a: np.ndarray, name: str) -> None:
-        path = os.path.join(OUT_DIR, name)
-        fp = np.memmap(path, dtype=np.uint16, mode="w+", shape=a.shape)
-        fp[:] = a[:]
+    def copy_slice(dst_path: str, start: int, length: int) -> None:
+        n_seqs = length // args.block_size
+        fp = np.memmap(dst_path, dtype=np.uint16, mode="w+",
+                       shape=(n_seqs, args.block_size))
+        done = 0
+        while done < length:
+            n = min(CHUNK_TOKENS, length - done)
+            fp.reshape(-1)[done:done + n] = flat[start + done:start + done + n]
+            done += n
         fp.flush()
         del fp
 
-    save_memmap(train, "train.bin")
-    save_memmap(val, "val.bin")
+    copy_slice(os.path.join(OUT_DIR, "train.bin"), 0, n_train)
+    copy_slice(os.path.join(OUT_DIR, "val.bin"), n_train, n_val)
+    del flat
+    os.remove(TMP_PATH)
 
     meta = {
         "vocab_size": vocab_size,
@@ -96,19 +111,19 @@ def main() -> None:
         "block_size": args.block_size,
         "n_train_tokens": int(n_train),
         "n_val_tokens": int(n_val),
-        "n_train_seqs": int(train.shape[0]),
-        "n_val_seqs": int(val.shape[0]),
+        "n_train_seqs": int(n_train // args.block_size),
+        "n_val_seqs": int(n_val // args.block_size),
         "dtype": "uint16",
     }
     with open(os.path.join(OUT_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"\nDone: {n_total/1e6:.1f}M tokens from {n_docs} docs "
+    print(f"\nDone: {n_total / 1e6:.1f}M tokens from {n_docs} docs "
           f"(vocab {vocab_size})")
-    print(f"  train: {train.shape[0]} seqs x {args.block_size} "
-          f"({n_train/1e6:.1f}M tokens)")
-    print(f"  val:   {val.shape[0]} seqs x {args.block_size} "
-          f"({n_val/1e6:.1f}M tokens)")
+    print(f"  train: {meta['n_train_seqs']} seqs x {args.block_size} "
+          f"({n_train / 1e6:.1f}M tokens)")
+    print(f"  val:   {meta['n_val_seqs']} seqs x {args.block_size} "
+          f"({n_val / 1e6:.1f}M tokens)")
 
 
 if __name__ == "__main__":
