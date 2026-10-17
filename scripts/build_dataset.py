@@ -33,6 +33,41 @@ VAL_FRACTION = 0.20  # 80/20 train/validation split
 CHUNK_TOKENS = 5_000_000  # memmap copy chunk size (keeps RAM low)
 
 
+def iter_docs(path: str, sep: bytes = EOS.encode("utf-8")):
+    """Yield documents split on the EOS separator, streaming in 8MB blocks.
+
+    The separator is pure ASCII so byte-level splitting is UTF-8 safe.
+    Never holds more than ~16MB in RAM regardless of file size.
+    """
+    with open(path, "rb") as f:
+        buf = b""
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            parts = buf.split(sep)
+            buf = parts.pop()  # last piece may straddle the next block
+            for p in parts:
+                text = p.decode("utf-8", errors="ignore").strip()
+                if text:
+                    yield text
+        tail = buf.decode("utf-8", errors="ignore").strip()
+        if tail:
+            yield tail
+
+
+def batched(iterable, n: int):
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--block-size", type=int, default=1024)
@@ -58,16 +93,14 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # Phase 1: stream-encode -> flat temp file, counting as we go.
+    # Files are read in 8MB blocks (iter_docs) so RAM stays flat
+    # no matter how large the corpus is.
     n_docs, n_total = 0, 0
     with open(TMP_PATH, "wb") as tmp:
         for path in files:
             name = os.path.basename(path)
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                docs = [d.strip() for d in f.read().split(EOS)]
-            docs = [d for d in docs if d]
-            print(f"{name}: {len(docs)} docs, encoding...", flush=True)
-            for i in range(0, len(docs), 256):
-                batch = docs[i:i + 256]
+            print(f"{name}: encoding...", flush=True)
+            for bi, batch in enumerate(batched(iter_docs(path), 256)):
                 buf = []
                 for enc in tok.encode_batch(batch):
                     buf.extend(enc.ids)
@@ -75,7 +108,7 @@ def main() -> None:
                 np.array(buf, dtype=np.uint16).tofile(tmp)
                 n_docs += len(batch)
                 n_total += len(buf)
-                if (i // 256) % 40 == 0:
+                if bi % 40 == 0:
                     print(f"  ... {n_docs} docs, {n_total / 1e6:.1f}M tokens",
                           flush=True)
     print(f"encoded {n_total / 1e6:.1f}M tokens from {n_docs} docs")
