@@ -79,22 +79,30 @@ def clean(text: str) -> str:
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-books", type=int, default=None,
+                    help="only download the first N books (quick test)")
+    args = ap.parse_args()
+
+    book_ids = BOOK_IDS[:args.max_books] if args.max_books else BOOK_IDS
     os.makedirs(RAW_DIR, exist_ok=True)
     ok, failed = 0, []
     total_bytes = 0
     with open(OUT_PATH, "w", encoding="utf-8") as out:
         first = True
-        for i, bid in enumerate(BOOK_IDS, 1):
+        for i, bid in enumerate(book_ids, 1):
+            print(f"[{i}/{len(book_ids)}] fetching id={bid}...", flush=True)
             path = fetch(bid)
             if path is None:
                 failed.append(bid)
-                print(f"[{i}/{len(BOOK_IDS)}] id={bid}: SKIP", flush=True)
+                print(f"[{i}/{len(book_ids)}] id={bid}: SKIP", flush=True)
                 continue
             with open(path, encoding="utf-8", errors="ignore") as f:
                 text = clean(f.read())
             if len(text) < 10_000:
                 failed.append(bid)
-                print(f"[{i}/{len(BOOK_IDS)}] id={bid}: too small, SKIP", flush=True)
+                print(f"[{i}/{len(book_ids)}] id={bid}: too small, SKIP", flush=True)
                 continue
             if not first:
                 out.write(EOS_SEP)
@@ -102,7 +110,7 @@ def main() -> None:
             first = False
             ok += 1
             total_bytes += len(text.encode("utf-8"))
-            print(f"[{i}/{len(BOOK_IDS)}] id={bid}: OK "
+            print(f"[{i}/{len(book_ids)}] id={bid}: OK "
                   f"({len(text)//1000}k chars, total {total_bytes//1_000_000}MB)",
                   flush=True)
     print(f"\nDone: {ok} books -> {OUT_PATH} ({total_bytes/1e6:.1f} MB)")
