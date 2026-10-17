@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+*.egg-info/
+
+# Data (regenerate with scripts/download_books.py + scripts/parse_wiki.py)
+data/raw/
+data/tokenized/
+.hf_cache/
+
+# Model artifacts (large)
+models/tokenizer-gpt2/
+models/checkpoints/
+*.bin
+*.pt
+*.gguf
+
+# OS / editor
+.DS_Store
+.vscode/
