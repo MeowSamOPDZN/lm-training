@@ -10,7 +10,6 @@ data/tokenized/
 .hf_cache/
 
 # Model artifacts (large)
-models/tokenizer-gpt2/
 models/checkpoints/
 *.bin
 *.pt
